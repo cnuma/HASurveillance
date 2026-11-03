@@ -1,0 +1,254 @@
+blueprint:
+  name: HASurveillance — santé de la maison
+  description: >-
+    Détecte les pannes silencieuses : appareil sur pile qui ne transmet plus
+    (Z-Wave, Zigbee2MQTT), entité indisponible, capteur figé, pile faible,
+    entité orpheline, sauvegarde trop ancienne. Notification dans Home
+    Assistant, tenue à jour toutes les heures ; rapport quotidien sur les
+    téléphones. Pour Z-Wave, activer l'entité « Last seen » de chaque
+    appareil ; pour Zigbee2MQTT, activer la disponibilité et last_seen.
+    Dépôt cnuma/HASurveillance.
+  domain: automation
+  source_url: https://github.com/cnuma/HASurveillance/blob/main/blueprints/automation/hasurveillance/surveillance.yaml
+  input:
+    telephones:
+      name: Téléphones
+      description: Appareils de l'application Home Assistant qui reçoivent le rapport quotidien.
+      default: []
+      selector:
+        device:
+          multiple: true
+          filter:
+            - integration: mobile_app
+    heure_rapport:
+      name: Heure du rapport
+      default: "09:00:00"
+      selector:
+        time:
+    rapport_si_ok:
+      name: Rapport même sans problème
+      description: >-
+        Envoie « Aucun problème » aux téléphones : prouve chaque jour que la
+        surveillance fonctionne.
+      default: false
+      selector:
+        boolean:
+    delai_contact:
+      name: Sans contact depuis
+      description: >-
+        Entités « Last seen » (Z-Wave, Zigbee2MQTT). Doit dépasser l'intervalle
+        de réveil des appareils sur pile.
+      default: 48
+      selector:
+        number:
+          min: 2
+          max: 336
+          unit_of_measurement: h
+    delai_indisponible:
+      name: Indisponible depuis
+      default: 60
+      selector:
+        number:
+          min: 5
+          max: 1440
+          step: 5
+          unit_of_measurement: min
+    surveilles:
+      name: Capteurs à activité quotidienne
+      description: >-
+        Entités qui changent d'état normalement chaque jour (porte d'entrée,
+        lumière très utilisée) : signalées si elles n'ont pas changé depuis la
+        durée ci-dessous.
+      default: []
+      selector:
+        entity:
+          multiple: true
+    jours_inactivite:
+      name: Sans changement depuis
+      default: 2
+      selector:
+        number:
+          min: 1
+          max: 30
+          unit_of_measurement: j
+    seuil_pile:
+      name: Pile faible sous
+      default: 20
+      selector:
+        number:
+          min: 5
+          max: 50
+          unit_of_measurement: "%"
+    capteur_sauvegarde:
+      name: Dernière sauvegarde réussie
+      description: Laisser vide pour ne pas surveiller les sauvegardes.
+      default: sensor.backup_last_successful_automatic_backup
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              device_class: timestamp
+    delai_sauvegarde:
+      name: Sauvegarde plus ancienne que
+      default: 48
+      selector:
+        number:
+          min: 12
+          max: 720
+          unit_of_measurement: h
+    exclusions_appareils:
+      name: Appareils ignorés
+      description: Appareils éteints volontairement, prêtés, en test…
+      default: []
+      selector:
+        device:
+          multiple: true
+    exclusions_entites:
+      name: Entités ignorées
+      default: []
+      selector:
+        entity:
+          multiple: true
+
+mode: single
+max_exceeded: silent
+
+variables:
+  telephones: !input telephones
+  rapport_si_ok: !input rapport_si_ok
+  delai_contact: !input delai_contact
+  delai_indisponible: !input delai_indisponible
+  surveilles: !input surveilles
+  jours_inactivite: !input jours_inactivite
+  seuil_pile: !input seuil_pile
+  capteur_sauvegarde: !input capteur_sauvegarde
+  delai_sauvegarde: !input delai_sauvegarde
+  exclusions_appareils: !input exclusions_appareils
+  exclusions_entites: !input exclusions_entites
+
+triggers:
+  - trigger: time
+    at: !input heure_rapport
+    id: rapport
+  - trigger: time_pattern
+    minutes: 5
+    id: horaire
+
+actions:
+  - variables:
+      # Entités ignorées : choisies, celles des appareils choisis, et celles des
+      # téléphones (pile, réseau : variables par nature).
+      exclus: >-
+        {% set r = namespace(l=exclusions_entites + integration_entities('mobile_app')) %}
+        {% for d in exclusions_appareils %}{% set r.l = r.l + device_entities(d) %}{% endfor %}
+        {{ r.l }}
+  - variables:
+      # Entités « Last seen » trop anciennes, nommées par leur appareil.
+      sans_contact: >-
+        {% set lim = now() - timedelta(hours=delai_contact | float) %}
+        {% set r = namespace(l=[]) %}
+        {% for s in states.sensor | selectattr('entity_id', 'search', '_last_seen$')
+             | selectattr('attributes.device_class', 'eq', 'timestamp')
+             | rejectattr('entity_id', 'in', exclus) %}
+          {% set t = as_datetime(s.state, none) %}
+          {% if t is not none and t < lim %}
+            {% set d = device_id(s.entity_id) %}
+            {% set n = (device_attr(d, 'name_by_user') or device_attr(d, 'name')) if d else s.name %}
+            {% set r.l = r.l + [n ~ ' (depuis le ' ~ as_local(t).strftime('%d/%m') ~ ')'] %}
+          {% endif %}
+        {% endfor %}
+        {{ r.l | sort }}
+      # Entité supprimée d'une intégration mais restée dans le registre.
+      orphelines: >-
+        {{ states | selectattr('state', 'eq', 'unavailable')
+           | selectattr('attributes.restored', 'eq', true)
+           | rejectattr('entity_id', 'in', exclus)
+           | map(attribute='entity_id') | sort | list }}
+      # Regroupées par appareil : un appareil hors ligne rend toutes ses
+      # entités indisponibles.
+      indisponibles: >-
+        {% set lim = now() - timedelta(minutes=delai_indisponible | float) %}
+        {% set r = namespace(l=[]) %}
+        {% for s in states | selectattr('state', 'eq', 'unavailable')
+             | rejectattr('attributes.restored', 'eq', true)
+             | rejectattr('entity_id', 'in', exclus)
+             | selectattr('last_changed', 'lt', lim) %}
+          {% set d = device_id(s.entity_id) %}
+          {% set n = (device_attr(d, 'name_by_user') or device_attr(d, 'name')) if d else s.entity_id %}
+          {% if n not in r.l %}{% set r.l = r.l + [n] %}{% endif %}
+        {% endfor %}
+        {{ r.l | sort }}
+      # Indisponibles déjà signalées plus haut.
+      inactifs: >-
+        {% set lim = now() - timedelta(days=jours_inactivite | float) %}
+        {% set r = namespace(l=[]) %}
+        {% for s in expand(surveilles) | rejectattr('entity_id', 'in', exclus)
+             | rejectattr('state', 'in', ['unavailable', 'unknown'])
+             | selectattr('last_changed', 'lt', lim) %}
+          {% set r.l = r.l + [s.name ~ ' (depuis le ' ~ as_local(s.last_changed).strftime('%d/%m') ~ ')'] %}
+        {% endfor %}
+        {{ r.l | sort }}
+      piles: >-
+        {% set r = namespace(l=[]) %}
+        {% for s in states.sensor | selectattr('attributes.device_class', 'eq', 'battery')
+             | rejectattr('entity_id', 'in', exclus) %}
+          {% if s.state | is_number and s.state | float < seuil_pile | float %}
+            {% set r.l = r.l + [s.name ~ ' (' ~ s.state | float | round(0) | int ~ ' %)'] %}
+          {% endif %}
+        {% endfor %}
+        {% for s in states.binary_sensor | selectattr('attributes.device_class', 'eq', 'battery')
+             | selectattr('state', 'eq', 'on') | rejectattr('entity_id', 'in', exclus) %}
+          {% set r.l = r.l + [s.name ~ ' (faible)'] %}
+        {% endfor %}
+        {{ r.l | sort }}
+      sauvegarde: >-
+        {% set t = as_datetime(states(capteur_sauvegarde), none) if capteur_sauvegarde else none %}
+        {% if not capteur_sauvegarde %}[]
+        {% elif t is none %}{{ ['aucune sauvegarde réussie connue'] }}
+        {% elif t < now() - timedelta(hours=delai_sauvegarde | float) %}{{ ['dernière le ' ~ as_local(t).strftime('%d/%m à %H:%M')] }}
+        {% else %}[]{% endif %}
+  - variables:
+      nombre: >-
+        {{ sans_contact | count + indisponibles | count + inactifs | count
+           + piles | count + orphelines | count + sauvegarde | count }}
+      # 10 lignes au plus par rubrique : le message reste lisible sur un
+      # téléphone.
+      corps: >-
+        {% set rubriques = [('Sans contact', sans_contact), ('Indisponibles', indisponibles),
+           ('Capteurs figés', inactifs), ('Piles faibles', piles),
+           ('Sauvegarde', sauvegarde), ('Entités orphelines, à supprimer', orphelines)] %}
+        {% set r = namespace(l=[]) %}
+        {% for titre, liste in rubriques if liste %}
+          {% set r.l = r.l + ([''] if r.l else []) + [titre ~ ' (' ~ liste | count ~ ') :'] %}
+          {% for x in liste[:10] %}{% set r.l = r.l + ['- ' ~ x] %}{% endfor %}
+          {% if liste | count > 10 %}{% set r.l = r.l + ['- … et ' ~ (liste | count - 10) ~ ' autres'] %}{% endif %}
+        {% endfor %}
+        {{ r.l | join('\n') }}
+      # Lancement manuel (Exécuter les actions) : comme le rapport quotidien.
+      envoyer: "{{ trigger is not defined or (trigger.id | default('rapport')) == 'rapport' }}"
+  - if:
+      - condition: template
+        value_template: "{{ nombre | int == 0 }}"
+    then:
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: hasurveillance
+    else:
+      - action: persistent_notification.create
+        data:
+          notification_id: hasurveillance
+          title: "Maison : {{ nombre }} problème{{ 's' if nombre | int > 1 }}"
+          message: "{{ corps }}"
+  - condition: template
+    value_template: "{{ envoyer and (nombre | int > 0 or rapport_si_ok) }}"
+  - repeat:
+      for_each: "{{ telephones }}"
+      sequence:
+        # Action de l'application : notify.mobile_app_<nom de l'appareil>.
+        - action: "notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}"
+          continue_on_error: true
+          data:
+            title: >-
+              {{ 'Maison : ' ~ nombre ~ ' problème' ~ ('s' if nombre | int > 1 else '')
+                 if nombre | int > 0 else 'Maison : aucun problème' }}
+            message: "{{ corps if nombre | int > 0 else 'Surveillance active, rien à signaler.' }}"
